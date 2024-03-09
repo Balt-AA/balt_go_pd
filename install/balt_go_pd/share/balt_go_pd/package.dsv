@@ -1,0 +1,6 @@
+source;share/balt_go_pd/hook/pythonpath.ps1
+source;share/balt_go_pd/hook/pythonpath.dsv
+source;share/balt_go_pd/hook/pythonpath.sh
+source;share/balt_go_pd/hook/ament_prefix_path.ps1
+source;share/balt_go_pd/hook/ament_prefix_path.dsv
+source;share/balt_go_pd/hook/ament_prefix_path.sh

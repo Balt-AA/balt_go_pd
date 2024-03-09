@@ -1,0 +1,7 @@
+[console_scripts]
+Controller_lib = balt_go_pd.Controller_lib:main
+Controller_module = balt_go_pd.Controller_module:main
+attacker_module = balt_go_pd.attacker_module:main
+trajectory_node = balt_go_pd.trajectory_node:main
+visualizer = balt_go_pd.visualizer:main
+
