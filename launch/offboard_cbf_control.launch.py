@@ -28,12 +28,12 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2',
             arguments=['-d', [os.path.join(package_dir, 'visualize.rviz')]]
-        ),
-        Node(
-            package='plotjuggler',
-            namespace='plotjuggler_with_layout',
-            executable='plotjuggler',
-            name='plotjuggler',
-            arguments=['--layout', [os.path.join(resource_folder, 'Pos_z_act.xml')]]
-        )        
+        )
+        # Node(
+        #     package='plotjuggler',
+        #     namespace='plotjuggler_with_layout',
+        #     executable='plotjuggler',
+        #     name='plotjuggler',
+        #     arguments=['--layout', [os.path.join(resource_folder, 'Pos_z_act.xml')]]
+        # )        
     ])
