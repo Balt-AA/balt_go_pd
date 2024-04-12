@@ -11,6 +11,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDur
 
 from geometry_msgs.msg import PoseStamped
 from px4_msgs.msg import *
+from std_msgs.msg import Int32
 from Controller_lib import Controller
 
 import linecache
@@ -19,7 +20,7 @@ import math
 import time
 from cvxopt import matrix, solvers
 from scipy.spatial.transform import Rotation as R
-from transforms3d.quaternions import quat2mat, mat2quat, qmult
+from transforms3d.quaternions import quat2mat, mat2quat, qmult, qinverse
 from transforms3d.euler import euler2mat, euler2quat
 
 
@@ -36,23 +37,12 @@ class Controller_module(Node):
             durability=QoSPresetProfiles.SENSOR_DATA.value.durability
             )
 
-        # qos_profile = QoSProfile(
-        #     reliability=QoSReliabilityPolicy.RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT,
-        #     durability=QoSDurabilityPolicy.RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL,
-        #     history=QoSHistoryPolicy.RMW_QOS_POLICY_HISTORY_KEEP_LAST,
-        #     depth=5
-        # )
-
         # Define subscribers
         self.status_subscriber_           = self.create_subscription(
             VehicleStatus, '/fmu/out/vehicle_status',
             self.vehicle_status_callback,
             qos_profile)
         
-        # self.local_position_subscriber_   = self.create_subscription(
-        #     VehicleLocalPosition, '/fmu/out/vehicle_local_position',
-        #     self.subscribe_vehicle_local_position,
-        #     qos_profile)
         
         self.vehicle_odometry_subscriber_ = self.create_subscription(
             VehicleOdometry,
@@ -65,8 +55,6 @@ class Controller_module(Node):
             '/command/pose', 
             self.command_pose_callback,
             10)
-
-        # self.local_position_subscriber_ =   self.create_subscription(VehicleLocalPosition, 'fmu/out/vehicle_local_position', self.subscribe_vehicle_local_position, 10) 
                
         # Define publishers
         self.offboard_mode_publisher_   = self.create_publisher(
@@ -78,10 +66,8 @@ class Controller_module(Node):
             '/fmu/in/actuator_motors',  
             10)
         
-        # self.attitude_setpoint_publisher_ = self.create_publisher(
-        #     AttitudeSetpoint,
-        #     '/fmu/in/attitude_setpoint',
-        #     10)
+        self.motor_failure_publisher_ = self.create_publisher(
+            Int32, '/motor_failure/motor_number', 10)        
         
         # Initialize 
         timer_period = 0.01  # seconds
@@ -100,9 +86,6 @@ class Controller_module(Node):
         self.ori_cmd = np.zeros(4, dtype=np.float32)
 
         # Initialize control output
-        #self.wrench = np.zeros(4)
-        #self.desired_quat = np.zeros(4)
-        #self.normalized_torque_thrust = np.zeros(4)
         self.throttles = np.zeros(4)
 
         # Inintialize UAV parameters
@@ -111,11 +94,18 @@ class Controller_module(Node):
         self.thrust_constant = 5.84e-06
         self.moment_constant = 0.06       
         self.arm_length = 0.25
-        #self.compute_ControlAllocation_and_ActuatorEffect_matrices()
+        self._inertia_matrix = np.array([0.029125, 0.029125, 0.055125])  # Inertia matrix
+        self._gravity = 9.81  # Gravity
+        self._uav_mass = 1.725  # UAV mass
 
         # Initialize matrices
         self.torques_and_thrust_to_rotor_velocities_ = np.zeros((4, 4))
         self.throttles_to_normalized_torques_and_thrust_ = np.zeros((4, 4))
+
+        # Attack parameters
+        self.callback_counter                   =   int(0)
+        self.motors_to_fail                     =   int(0)
+        self.attack_on_off                      =   int(0)
 
     def cmdloop_callback(self):
         # Publish offboard control modes
@@ -133,7 +123,7 @@ class Controller_module(Node):
         controller_ = Controller()
 
         # Initialize UAV parameters with placeholder values
-        controller_.set_uav_parameters(1.725, np.array([0.029125, 0.029125, 0.055225]), 9.81)
+        controller_.set_uav_parameters(self._uav_mass, self._inertia_matrix, self._gravity)
         controller_.set_control_gains(np.array([7.0, 7.0, 6.0]), np.array([6.0, 6.0, 3.0]), np.array([3.5, 3.5, 0.3]), np.array([0.5, 0.5, 0.1]))
         
         pos_odo1, vel_odo1, quat_odo1, angvel_odo1 = self.eigen_odometry_from_PX4_msg(self.pos_odo, self.vel_odo, self.quat_odo, self.angvel_odo)
@@ -144,30 +134,34 @@ class Controller_module(Node):
 
         # Calculate controller output
         wrench, desired_quat = controller_.calculate_controller_output()
-        print("wrench")
-        print(wrench)
         normalized_torque_thrust, throttles = self.px4InverseSITL(wrench)
 
         if self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
-            
             current_time = int(Clock().now().nanoseconds / 1000)
+
+            self.callback_counter += 1
+
+            if self.callback_counter == 901:
+                self.motors_to_fail = int(1)                    # Randomly select one motors from 1 to 4
+                self.attack_on_off = 1
+                self.publish_motor_failure(self.motors_to_fail)
+
+            elif self.callback_counter == 950:
+                self.publish_motor_failure(0)
+                self.callback_counter = 0
+                self.attack_on_off = 0
 
             # Calculate controller output
             self.actuator_motors_publish_(throttles)
             # self.attitude_setpoint_publish_(wrench[3]/1000, desired_quat)
 
 
-        self.get_logger().info(f'time: {self.time_temp}, \n \
-                                 Odometry Position: {self.pos_odo}, \n Quaternion: {self.quat_odo}, \n Velocity: {self.vel_odo}, \n \
-                                 Angular Velocity: {self.angvel_odo}, \n Desired Position: {self.pos_cmd}, \n Desired Orientation: {self.ori_cmd}, \n \
-                                 Navigation State: {self.nav_state}, \n \
-                                 Desired Quaternion: {controller_.r_R_B_W}, \n Desired Yaw: {controller_.r_yaw}')
+        # self.get_logger().info(f'time: {self.time_temp}, \n \
+        #                          Odometry Position: {self.pos_odo}, \n Quaternion: {self.quat_odo}, \n Velocity: {self.vel_odo}, \n \
+        #                          Angular Velocity: {self.angvel_odo}, \n Desired Position: {self.pos_cmd}, \n Desired Orientation: {self.ori_cmd}, \n \
+        #                          Navigation State: {self.nav_state}, \n \
+        #                          Desired Quaternion: {controller_.r_R_B_W}, \n Desired Yaw: {controller_.r_yaw}')
     
-        # print('=============== State check panel ===============')
-        # print('Position Odometry[m]: %.3f %.3f %.3f' %(self.pos_odo[0], self.pos_odo[1], self.pos_odo[2]))
-        # print('Position Desired [m]: %.3f %.3f %.3f' %(self.pos_cmd[0], self.pos_cmd[1], self.pos_cmd[2]))
-        # print('Quarternion [-]: %.3f %.3f %.3f' %(self.pos_cmd[0], self.pos_cmd[1], self.pos_cmd[2]))
-
     def compute_ControlAllocation_and_ActuatorEffect_matrices(self):
         kDegToRad = np.pi / 180.0
         kS = np.sin(45 * kDegToRad)
@@ -217,30 +211,321 @@ class Controller_module(Node):
                 [-242159.856570736, 242159.856570736, 713470.319634703, 42808.2191780822]
                 ])
 
+        quat_odo_euler = self.rotate_quaternion_from_to_ENU_NED(self.quat_odo)
+
+
         # Control allocation: Wrench to Rotational velocities (omega)
         omega = array @ wrench
         omega = np.sqrt(np.abs(omega))  # Element-wise square root, handle negative values
-        print("omega")
-        print(omega)
         
         # CBF
-        indv_forces = omega * np.abs(omega) * self.thrust_constant  
+        indv_forces = omega * np.abs(omega) * self.thrust_constant
+        # print("indv_forces")
+        # print(indv_forces)
+
+        if self.attack_on_off == 0:
+            u_safe = self.control_barrier_function_Noattack(indv_forces)
+        else:
+            u_safe = self.control_barrier_function_Attack(indv_forces)
         
+        u_safe = np.array([u_safe[0], u_safe[1], u_safe[2], u_safe[3]], dtype=np.float32)
+        # print("u_safe")
+        # print(u_safe)
+
+        # Calculate throttles
+        omega = np.sqrt(np.abs(u_safe)/self.thrust_constant)   
+    
         # Calculate hrottles from omega (rotor velocities)
         throttles = (omega - (self.zero_position_armed * ones_temp))
         throttles = throttles / self.input_scaling
 
-        #np.clip(throttles, 0.0, 0.9, out=throttles)
-
-
-        print("throttles")
-        print(throttles)
+        # print("throttles")
+        # print(throttles)
         
         # Inverse Mixing: throttles to normalized torques and thrust
         normalized_torque_and_thrust = self.throttles_to_normalized_torques_and_thrust_ @ throttles
 
         return normalized_torque_and_thrust, throttles
 
+    # CBF Function (No attack)
+    def control_barrier_function_Noattack(self, indv_f):
+        x_state = np.zeros(12)
+        f_x = np.zeros(12)
+        barrier_phi_max = 15 / 180 * np.pi
+        barrier_theta_max = 15 / 180 * np.pi
+        barrier_zdelta_max = 10
+        barrier_vz_max = 10
+        u_max = 1.2 * self._uav_mass * self._gravity / 4
+        u_min = 0
+
+        rotated_q = self.rotate_quaternion_from_to_ENU_NED(self.quat_odo)
+        # rotated_q = qinverse(rotated_q)
+        if np.linalg.norm(rotated_q) == 0:
+            rotated_q = np.array([0, 0, 0, 1])
+
+        phi, theta, psi = self.euler_from_quaternion(rotated_q[1], rotated_q[2], rotated_q[3], rotated_q[0]) # Expected Error Part
+        p, q, r = self.rotate_vector_from_to_FRD_FLU(self.angvel_odo) 
+        pos_r = self.rotate_vector_from_to_ENU_NED(self.pos_cmd)
+        pos_odo_rotated = self.rotate_vector_from_to_ENU_NED(self.pos_odo).flatten()
+        vel_odo_rotated = self.rotate_vector_from_to_ENU_NED(self.vel_odo).flatten()
+
+        cp          =   np.cos(phi)
+        ct          =   np.cos(theta)
+        cs          =   np.cos(psi)
+        sp          =   np.sin(phi)
+        st          =   np.sin(theta)
+        ss          =   np.sin(psi)
+        tt          =   np.tan(theta)
+        sect        =   1 / (np.cos(theta) + 10e-6)
+
+        B = np.array([[1, sp*tt, cp*tt], \
+                        [0, cp, -sp], \
+                        [0, sp/ct, cp/ct]])
+        
+        Euler_dot = B @ np.array([p, q, r])
+
+        x_state = np.array([pos_odo_rotated[0], pos_odo_rotated[1], pos_odo_rotated[2], \
+                            vel_odo_rotated[0], vel_odo_rotated[1], vel_odo_rotated[2], \
+                            phi, theta, psi,                      \
+                            p, q, r])        
+        
+        f_x = np.array([vel_odo_rotated[0], vel_odo_rotated[1], vel_odo_rotated[2],   \
+                          0, 0, -self._gravity,                             \
+                          Euler_dot[0], Euler_dot[1], Euler_dot[2],                                        \
+                          q*r*(self._inertia_matrix[1] - self._inertia_matrix[2])/self._inertia_matrix[0], \
+                          p*r*(self._inertia_matrix[2] - self._inertia_matrix[0])/self._inertia_matrix[1], \
+                          p*q*(self._inertia_matrix[0] - self._inertia_matrix[1])/self._inertia_matrix[2]]) # Expected Error Part (p, q, r)
+
+        G_mat = np.array([[0, 0, 0, 0], \
+                            [0, 0, 0, 0], \
+                            [0, 0, 0, 0],
+                            [self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass, self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass, self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass, self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass],
+                            [self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass, self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass, self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass, self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass], 
+                            [self.thrust_constant*(cp*ct)/self._uav_mass, self.thrust_constant*(cp*ct)/self._uav_mass, self.thrust_constant*(cp*ct)/self._uav_mass, self.thrust_constant*(cp*ct)/self._uav_mass], 
+                            [0, 0, 0, 0],
+                            [0, 0, 0, 0],
+                            [0, 0, 0, 0],
+                            [self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2))],
+                            [-self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2))],
+                            [self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2]]])
+                             # Expected Error Part (v1. Changed the x, y part)
+        
+        # Barrier Function (roll) # Expected Error Part 
+        Broll           =   (x_state[6]/barrier_phi_max) **2 - 1
+        LfBroll         =   2*x_state[6]/(barrier_phi_max**2)*f_x[6]
+        etaBroll        =   np.array([1, 1]) @ np.array([Broll, LfBroll])
+        Lf2Broll        =   2/(barrier_phi_max**2)*f_x[6]**2 + 2*x_state[6]/(barrier_phi_max**2)*(f_x[9]+f_x[10]*sp*tt+f_x[11]*cp*tt+ \
+                            x_state[10]*cp*Euler_dot[0]*tt+x_state[10]*sp*(sect**2)*Euler_dot[1]-x_state[11]*sp*Euler_dot[0]*tt+x_state[11]*cp*(sect**2)*Euler_dot[1])
+        LgLfBroll       =   2*x_state[6]/(barrier_phi_max**2)*(G_mat[9,:]+G_mat[10,:]*sp*tt+G_mat[11,:]*cp*tt) # Expected Error Part (Matrix Indexing)
+
+        # Barrier Funciton (pitch) # Expected Error Part 
+        Bpitch          =   (x_state[7]/barrier_theta_max) **2 - 1
+        LfBpitch        =   2*x_state[7]/(barrier_theta_max**2)*f_x[7]
+        etaBpitch       =   np.array([1, 1]) @ np.array([Bpitch, LfBpitch])
+        Lf2Bpitch       =   2/(barrier_theta_max**2)*f_x[7]**2 + 2*x_state[7]/(barrier_theta_max**2)*(f_x[10]*cp-f_x[11]*sp-x_state[10]*sp* \
+                                                                                                      Euler_dot[0]-x_state[11]*cp*Euler_dot[0])
+        LgLfBpitch      =   2*x_state[7]/(barrier_theta_max**2)*(G_mat[10,:]*cp-G_mat[11,:]*sp)
+
+        # Barrier Function (altitude) # Expected Error Part 
+        Baltitude       =   (x_state[2]-pos_r[2]) ** 4/(barrier_zdelta_max**4) + x_state[5] ** 4 / (barrier_vz_max**4) - 1 # Expected Error Part 
+        LfBaltitude     =   4*(x_state[2]-pos_r[2]) **3/(barrier_zdelta_max**4)*f_x[2] + 4*x_state[5] ** 3 / (barrier_vz_max**4)*f_x[5]
+        LgBaltitude     =   4*(x_state[2]-pos_r[2]) **3/(barrier_zdelta_max**4)*G_mat[5,:]
+
+        A_ineq = np.array([
+                    [LgLfBroll[0], LgLfBroll[1], LgLfBroll[2], LgLfBroll[3], etaBroll, 0, 0, 1, 0, 0],
+                    [LgLfBpitch[0], LgLfBpitch[1], LgLfBpitch[2], LgLfBpitch[3], 0, etaBpitch, 0, 0, 1, 0],
+                    [LgBaltitude[0], LgBaltitude[1], LgBaltitude[2], LgBaltitude[3], 0, 0, Baltitude, 0, 0, 1],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [-1,0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0,-1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0,-1, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, -1,0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0,-1, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0,-1, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0,-1, 0, 0, 0]
+                    ], dtype=np.float64)
+        
+        B_ineq = np.array([
+                    [-Lf2Broll],
+                    [-Lf2Bpitch],
+                    [-LfBaltitude],
+                    [u_max],        
+                    [u_min],
+                    [u_max],
+                    [u_min],
+                    [u_max],
+                    [u_min],
+                    [u_max],
+                    [u_min],
+                    [-0.01],
+                    [-0.01],
+                    [-0.01]
+                    ], dtype=np.float64)
+        
+        Q = np.eye(10, dtype=np.float64)
+        Q[7,7] = 20
+        Q[8,8] = 20
+        Q[9,9] = 20
+
+        f = np.array([-indv_f[0], -indv_f[1], -indv_f[2], -indv_f[3], 0, 0, 0, 0, 0, 0], dtype=np.float64)
+        
+        # Compute the control barrier function
+        P = matrix(Q)
+        q = matrix(f)
+        G = matrix(A_ineq)
+        h = matrix(B_ineq)
+        initvals = matrix([indv_f[0], indv_f[1], indv_f[2], indv_f[3], 0, 0, 0, 0, 0, 0])
+
+        # Solve QP problem
+        solvers.options['show_progress'] = False
+        solution = solvers.qp(P, q, G, h, initvals=initvals)
+
+        u_temp = solution['x']
+
+        return u_temp[0:4]
+
+ # CBF Function (Attack)
+    def control_barrier_function_Attack(self, indv_f):
+        x_state = np.zeros(12)
+        f_x = np.zeros(12)
+        barrier_phi_max = 15 / 180 * np.pi
+        barrier_theta_max = 15 / 180 * np.pi
+        barrier_zdelta_max = 10
+        barrier_vz_max = 10
+        u_max = 1.2 * self._uav_mass * self._gravity / 4
+        u_min = 0
+
+        rotated_q = self.rotate_quaternion_from_to_ENU_NED(self.quat_odo)
+        # rotated_q = qinverse(rotated_q)
+        if np.linalg.norm(rotated_q) == 0:
+            rotated_q = np.array([0, 0, 0, 1])
+
+        phi, theta, psi = self.euler_from_quaternion(rotated_q[1], rotated_q[2], rotated_q[3], rotated_q[0]) # Expected Error Part
+        p, q, r = self.rotate_vector_from_to_FRD_FLU(self.angvel_odo) 
+        pos_r = self.rotate_vector_from_to_ENU_NED(self.pos_cmd)
+        pos_odo_rotated = self.rotate_vector_from_to_ENU_NED(self.pos_odo).flatten()
+        vel_odo_rotated = self.rotate_vector_from_to_ENU_NED(self.vel_odo).flatten()
+
+        cp          =   np.cos(phi)
+        ct          =   np.cos(theta)
+        cs          =   np.cos(psi)
+        sp          =   np.sin(phi)
+        st          =   np.sin(theta)
+        ss          =   np.sin(psi)
+        tt          =   np.tan(theta)
+        sect        =   1 / (np.cos(theta) + 10e-6)
+
+        B = np.array([[1, sp*tt, cp*tt], \
+                        [0, cp, -sp], \
+                        [0, sp/ct, cp/ct]])
+        
+        Euler_dot = B @ np.array([p, q, r])
+
+        x_state = np.array([pos_odo_rotated[0], pos_odo_rotated[1], pos_odo_rotated[2], \
+                            vel_odo_rotated[0], vel_odo_rotated[1], vel_odo_rotated[2], \
+                            phi, theta, psi,                      \
+                            p, q, r])        
+        
+        f_x = np.array([vel_odo_rotated[0], vel_odo_rotated[1], vel_odo_rotated[2],   \
+                          0, 0, -self._gravity,                             \
+                          Euler_dot[0], Euler_dot[1], Euler_dot[2],                                        \
+                          q*r*(self._inertia_matrix[1] - self._inertia_matrix[2])/self._inertia_matrix[0], \
+                          p*r*(self._inertia_matrix[2] - self._inertia_matrix[0])/self._inertia_matrix[1], \
+                          p*q*(self._inertia_matrix[0] - self._inertia_matrix[1])/self._inertia_matrix[2]]) # Expected Error Part (p, q, r)
+
+        G_mat = np.array([[0, 0, 0, 0], \
+                            [0, 0, 0, 0], \
+                            [0, 0, 0, 0],
+                            [self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass, self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass, self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass, self.thrust_constant*(cp*ss*st-cs*sp)/self._uav_mass],
+                            [self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass, self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass, self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass, self.thrust_constant*(sp*ss+cp*cs*st)/self._uav_mass], 
+                            [self.thrust_constant*(cp*ct)/self._uav_mass, self.thrust_constant*(cp*ct)/self._uav_mass, self.thrust_constant*(cp*ct)/self._uav_mass, self.thrust_constant*(cp*ct)/self._uav_mass], 
+                            [0, 0, 0, 0],
+                            [0, 0, 0, 0],
+                            [0, 0, 0, 0],
+                            [self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2))],
+                            [-self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2))],
+                            [self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2]]])
+                             # Expected Error Part (v1. Changed the x, y part)
+        
+        # Barrier Function (roll) # Expected Error Part 
+        Broll           =   (x_state[6]/barrier_phi_max) **2 - 1
+        LfBroll         =   2*x_state[6]/(barrier_phi_max**2)*f_x[6]
+        etaBroll        =   np.array([1, 1]) @ np.array([Broll, LfBroll])
+        Lf2Broll        =   2/(barrier_phi_max**2)*f_x[6]**2 + 2*x_state[6]/(barrier_phi_max**2)*(f_x[9]+f_x[10]*sp*tt+f_x[11]*cp*tt+ \
+                            x_state[10]*cp*Euler_dot[0]*tt+x_state[10]*sp*(sect**2)*Euler_dot[1]-x_state[11]*sp*Euler_dot[0]*tt+x_state[11]*cp*(sect**2)*Euler_dot[1])
+        LgLfBroll       =   2*x_state[6]/(barrier_phi_max**2)*(G_mat[9,:]+G_mat[10,:]*sp*tt+G_mat[11,:]*cp*tt) # Expected Error Part (Matrix Indexing)
+
+        # Barrier Funciton (pitch) # Expected Error Part 
+        Bpitch          =   (x_state[7]/barrier_theta_max) **2 - 1
+        LfBpitch        =   2*x_state[7]/(barrier_theta_max**2)*f_x[7]
+        etaBpitch       =   np.array([1, 1]) @ np.array([Bpitch, LfBpitch])
+        Lf2Bpitch       =   2/(barrier_theta_max**2)*f_x[7]**2 + 2*x_state[7]/(barrier_theta_max**2)*(f_x[10]*cp-f_x[11]*sp-x_state[10]*sp* \
+                                                                                                      Euler_dot[0]-x_state[11]*cp*Euler_dot[0])
+        LgLfBpitch      =   2*x_state[7]/(barrier_theta_max**2)*(G_mat[10,:]*cp-G_mat[11,:]*sp)
+
+        # Barrier Function (altitude) # Expected Error Part 
+        Baltitude       =   (x_state[2]-pos_r[2]) ** 4/(barrier_zdelta_max**4) + x_state[5] ** 4 / (barrier_vz_max**4) - 1 # Expected Error Part 
+        LfBaltitude     =   4*(x_state[2]-pos_r[2]) **3/(barrier_zdelta_max**4)*f_x[2] + 4*x_state[5] ** 3 / (barrier_vz_max**4)*f_x[5]
+        LgBaltitude     =   4*(x_state[2]-pos_r[2]) **3/(barrier_zdelta_max**4)*G_mat[5,:]
+
+        A_ineq = np.array([
+                    [LgLfBroll[0], LgLfBroll[1], LgLfBroll[2], 0, etaBroll, 0, 0, 1, 0, 0],
+                    [LgLfBpitch[0], LgLfBpitch[1], LgLfBpitch[2], 0, 0, etaBpitch, 0, 0, 1, 0],
+                    [LgBaltitude[0], LgBaltitude[1], LgBaltitude[2], 0, 0, 0, Baltitude, 0, 0, 1],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [-1,0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0,-1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0,-1, 0, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, -1,0, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0,-1, 0, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0,-1, 0, 0, 0, 0],
+                    [0, 0, 0, 0, 0, 0,-1, 0, 0, 0]
+                    ], dtype=np.float64)
+        
+        B_ineq = np.array([
+                    [-Lf2Broll-max(LgLfBroll[3]*u_max, LgLfBroll[3]*u_min)],
+                    [-Lf2Bpitch-max(LgLfBpitch[3]*u_max, LgLfBpitch[3]*u_min)],
+                    [-LfBaltitude-max(LgBaltitude[3]*u_max, LgBaltitude[3]*u_min)],
+                    [u_max],        
+                    [u_min],
+                    [u_max],
+                    [u_min],
+                    [u_max],
+                    [u_min],
+                    [u_max],
+                    [u_min],
+                    [-0.01],
+                    [-0.01],
+                    [-0.01]
+                    ], dtype=np.float64)
+        
+        Q = np.eye(10, dtype=np.float64)
+        Q[7,7] = 100
+        Q[8,8] = 100
+        Q[9,9] = 100
+
+        f = np.array([-indv_f[0], -indv_f[1], -indv_f[2], -indv_f[3], 0, 0, 0, 0, 0, 0], dtype=np.float64)
+        
+        # Compute the control barrier function
+        P = matrix(Q)
+        q = matrix(f)
+        G = matrix(A_ineq)
+        h = matrix(B_ineq)
+        initvals = matrix([indv_f[0], indv_f[1], indv_f[2], indv_f[3], 0, 0, 0, 0, 0, 0])
+
+        # Solve QP problem
+        solvers.options['show_progress'] = False
+        solution = solvers.qp(P, q, G, h, initvals=initvals)
+
+        u_temp = solution['x']
+
+        return u_temp[0:4]
 
     # Function for Sliding Mode Conrol Barrier Function
     def hyper_tangent(self, input_signal, gain=1.0):
@@ -253,14 +538,6 @@ class Controller_module(Node):
         print("NAV_STATUS: ", msg.nav_state)
         print("  - offboard status: ", VehicleStatus.NAVIGATION_STATE_OFFBOARD)
         self.nav_state = msg.nav_state
-
-    # def subscribe_vehicle_local_position(self, msg):
-    #     self.pos_x_                                 =   np.float32(msg.x)
-    #     self.pos_y_                                 =   np.float32(msg.y)
-    #     self.pos_z_                                 =   np.float32(msg.z)
-    #     self.vel_x_                                 =   np.float32(msg.vx)
-    #     self.vel_y_                                 =   np.float32(msg.vy)
-    #     self.vel_z_                                 =   np.float32(msg.vz)
 
     def command_pose_callback(self, msg):
         # Extract position and orientation from the message
@@ -336,72 +613,81 @@ class Controller_module(Node):
 
         self.attitude_setpoint_publisher_.publish(msg)
 
+    def publish_motor_failure(self, motor_id):
+        msg = Int32()
+        msg.data = motor_id
+        self.motor_failure_publisher_.publish(msg)
+        self.get_logger().info(f'Publishing motor failure on motor: {msg.data}')
+
     def rotate_quaternion_from_to_ENU_NED(self, quat_in):
         # Transform from orientation represented in ROS format to PX4 format and back.
-        # Using scipy's Rotation module for quaternion operations.
         # quat_in_reordered = [quat_in[1], quat_in[2], quat_in[3], quat_in[0]]
     
         # NED to ENU conversion Euler angles
         euler_1 = np.array([np.pi, 0.0, np.pi/2])
         NED_ENU_Q = euler2quat(euler_1[2], euler_1[1], euler_1[0], 'szyx')
-        #NED_ENU_Q = mat2quat(NED_ENU_Q)
-        print("NED_ENU_Q")
-        print(NED_ENU_Q)
+        # print("NED_ENU_Q")
+        # print(NED_ENU_Q)
 
         # Aircraft to baselink conversion Euler angles
         euler_2 = np.array([np.pi, 0.0, 0.0])
         AIRCRAFT_BASELINK_Q = euler2quat(euler_2[2], euler_2[1], euler_2[0], 'szyx')
-        #AIRCRAFT_BASELINK_Q = mat2quat(AIRCRAFT_BASELINK_Q)
-        print("AIRCRAFT_BASELINK_Q")
-        print(AIRCRAFT_BASELINK_Q)
+        # print("AIRCRAFT_BASELINK_Q")
+        # print(AIRCRAFT_BASELINK_Q)
 
         # Perform the quaternion multiplications to achieve the desired rotation
         # Note: the multiply function from transforms3d takes quaternions in [w, x, y, z] format
         result_quat = qmult(NED_ENU_Q, quat_in)
         result_quat = qmult(result_quat, AIRCRAFT_BASELINK_Q)
 
-        #quat_in_reordered = np.array([quat_in[1], quat_in[2], quat_in[3], quat_in[0]])
-        #rotated_R_quat = self.quaternion_multiply(self.quaternion_multiply(NED_ENU_Q, quat_in), AIRCRAFT_BASELINK_Q)
-
         # # Convert the rotated quaternion back to w, x, y, z order before returning
         return result_quat          # ordering (w, x, y, z)
-
-    def quaternion_multiply(self, q0, q1):
-        """
-        Multiplies two quaternions.
-
-        Input
-        :param q0: A 4 element array containing the first quaternion (q01, q11, q21, q31)
-        :param q1: A 4 element array containing the second quaternion (q02, q12, q22, q32)
-
-        Output
-        :return: A 4 element array containing the final quaternion (q03,q13,q23,q33)
-
-        """
-        # Extract the values from q0
-        w0 = q0[3]
-        x0 = q0[0]
-        y0 = q0[1]
-        z0 = q0[2]
-
-        # Extract the values from q1
-        w1 = q1[3]
-        x1 = q1[0]
-        y1 = q1[1]
-        z1 = q1[2]
-
-        # Computer the product of the two quaternions, term by term
-        q0q1_w = w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1
-        q0q1_x = w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1
-        q0q1_y = w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1
-        q0q1_z = w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1
-
-        # Create a 4 element array containing the final quaternion
-        final_quaternion = np.array([q0q1_w, q0q1_x, q0q1_y, q0q1_z])
-
-        # Return a 4 element array containing the final quaternion (q02,q12,q22,q32)
-        return final_quaternion
     
+    def quaternion_rotation_matrix(self,Q):
+        # Extract the values from Q   (w-x-y-z) #### NEED TRANSPOSE
+        q0 = Q[0]
+        q1 = Q[1]
+        q2 = Q[2]
+        q3 = Q[3]
+     
+        # First row of the rotation matrix
+        r00 = q0 * q0 + q1 * q1 - q2 * q2 - q3 * q3
+        r01 = 2 * (q1 * q2 - q0 * q3)
+        r02 = 2 * (q1 * q3 + q0 * q2)
+     
+        # Second row of the rotation matrix
+        r10 = 2 * (q1 * q2 + q0 * q3)
+        r11 = q0 * q0 - q1 * q1 + q2 * q2 - q3 * q3
+        r12 = 2 * (q2 * q3 - q0 * q1)
+     
+        # Third row of the rotation matrix
+        r20 = 2 * (q1 * q3 - q0 * q2)
+        r21 = 2 * (q2 * q3 + q0 * q1)
+        r22 = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3 
+     
+        # 3x3 rotation matrix
+        rot_matrix = np.array([[r00, r01, r02],
+                           [r10, r11, r12],
+                           [r20, r21, r22]])
+                            
+        return rot_matrix    
+
+    def euler_from_quaternion(self, x, y, z, w):
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        roll_x = math.atan2(t0, t1)
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        pitch_y = math.asin(t2)
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        yaw_z = math.atan2(t3, t4)
+
+        return roll_x, pitch_y, yaw_z # in radians
+
 def main():
     rclpy.init(args=None)
 

@@ -41,7 +41,6 @@ class Controller():
         self.orientation_B_W_temp = np.array([orientation_B_W[1], orientation_B_W[2], orientation_B_W[3], orientation_B_W[0]])  #Quaternion reordering (x, y, z, w)
         if norm(self.orientation_B_W_temp) == 0:
             self.orientation_B_W_temp = np.array([0.0, 0.0, 0.0, 1.0])
-        #self.R_B_W = R.from_quat(self.orientation_B_W_temp).as_matrix()
         self.R_B_W = self.quaternion_rotation_matrix(orientation_B_W)
         self.position_W = position_W
         self.velocity_W = velocity_B #self.R_B_W @ 
@@ -51,7 +50,6 @@ class Controller():
         self.r_position_W = position_W
         self.r_velocity_W = np.zeros(3)
         self.r_acceleration_W = np.zeros(3)
-        #self.orientation_W_temp = np.array([orientation_W[3], orientation_W[0], orientation_W[1], orientation_W[2]])  #Quaternion reordering (w, x, y, z)
         if norm(orientation_W) == 0:
             orientation_W = np.array([0.0, 0.0, 0.0, 1.0])
         self.r_R_B_W = R.from_quat(orientation_W).as_matrix()
@@ -59,7 +57,7 @@ class Controller():
         self.r_yaw_rate = 0.0
 
     def quaternion_rotation_matrix(self,Q):
-        # Extract the values from Q   (w-x-y-z) #### NEED TRANSPOSE
+        # Extract the values from Q   (w-x-y-z) 
         q0 = Q[0]
         q1 = Q[1]
         q2 = Q[2]
@@ -146,11 +144,7 @@ class Controller():
         B_x_d = np.array([np.cos(self.r_yaw), np.sin(self.r_yaw), 0.0])
         B_y_d = np.cross(B_z_d, B_x_d)
         B_y_d1 = B_y_d / norm(B_y_d)
-        R_d_w = np.array([np.cross(B_y_d1, B_z_d), B_y_d, B_z_d]) # /norm(np.cross(B_y_d1, B_z_d))
-
-        print("R_d_w")
-        print(R_d_w)    
-        # R_d_w = np.identity(3)
+        R_d_w = np.array([np.cross(B_y_d1, B_z_d), B_y_d, B_z_d]) # /norm(np.cross(B_y_d1, B_z_d))  
 
         q_temp = R.from_matrix(R_d_w).as_quat()
         q_temp = np.array([q_temp[3], q_temp[0], q_temp[1], q_temp[2]])  # Quaternion reordering (w, x, y, z)
@@ -168,10 +162,10 @@ class Controller():
         self.controller_torque_thrust[:3] = tau
         self.controller_torque_thrust[3] = thrust
 
-        print("Tau")
-        print(tau)
-        print("Thrust")
-        print(thrust)
+        # print("Tau")
+        # print(tau)
+        # print("Thrust")
+        # print(thrust)
 
 
         return self.controller_torque_thrust, self.desired_quaternion
