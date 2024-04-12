@@ -23,7 +23,7 @@ class trajectory_node(Node):
 
         pose_stamped.pose.position.x = 0.0 #self.A * math.sin(self.angle)
         pose_stamped.pose.position.y = 0.0 #self.A * math.cos(self.angle)
-        pose_stamped.pose.position.z = 2.5  # Adjust Z as needed
+        pose_stamped.pose.position.z = 10.0  # Adjust Z as needed
         pose_stamped.pose.orientation.w = 1.0  # Assuming no rotation
 
         self.publisher_.publish(pose_stamped)

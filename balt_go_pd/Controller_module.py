@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import sys
-sys.path.append('/home/user/work/ros2_ws/src/balt_go_pd/balt_go_pd')
+sys.path.append('/home/balt204/llc/ss_ws/src/balt_go_pd/balt_go_pd')
 
 import rclpy
 import numpy as np
@@ -70,7 +70,7 @@ class Controller_module(Node):
             Int32, '/motor_failure/motor_number', 10)        
         
         # Initialize 
-        timer_period = 0.01  # seconds
+        timer_period = 0.005  # seconds
         self.timer = self.create_timer(timer_period, self.cmdloop_callback)
         self.nav_state = VehicleStatus.NAVIGATION_STATE_MAX
         
@@ -113,7 +113,6 @@ class Controller_module(Node):
         
         wrench = np.zeros(4)
         desired_quat = np.zeros(4)
-        normalized_torque_thrust = np.zeros(4)
         throttles = np.zeros(4)
         pos_odo1 = np.zeros(3)
         vel_odo1 = np.zeros(3)
@@ -134,19 +133,19 @@ class Controller_module(Node):
 
         # Calculate controller output
         wrench, desired_quat = controller_.calculate_controller_output()
-        normalized_torque_thrust, throttles = self.px4InverseSITL(wrench)
+        throttles = self.px4InverseSITL(wrench)
 
         if self.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
             current_time = int(Clock().now().nanoseconds / 1000)
 
             self.callback_counter += 1
 
-            if self.callback_counter == 901:
+            if self.callback_counter == 1801:
                 self.motors_to_fail = int(1)                    # Randomly select one motors from 1 to 4
                 self.attack_on_off = 1
                 self.publish_motor_failure(self.motors_to_fail)
 
-            elif self.callback_counter == 950:
+            elif self.callback_counter == 1900:
                 self.publish_motor_failure(0)
                 self.callback_counter = 0
                 self.attack_on_off = 0
@@ -211,9 +210,6 @@ class Controller_module(Node):
                 [-242159.856570736, 242159.856570736, 713470.319634703, 42808.2191780822]
                 ])
 
-        quat_odo_euler = self.rotate_quaternion_from_to_ENU_NED(self.quat_odo)
-
-
         # Control allocation: Wrench to Rotational velocities (omega)
         omega = array @ wrench
         omega = np.sqrt(np.abs(omega))  # Element-wise square root, handle negative values
@@ -229,33 +225,36 @@ class Controller_module(Node):
             u_safe = self.control_barrier_function_Attack(indv_forces)
         
         u_safe = np.array([u_safe[0], u_safe[1], u_safe[2], u_safe[3]], dtype=np.float32)
-        # print("u_safe")
-        # print(u_safe)
+        # # print("u_safe")
+        # # print(u_safe)
 
         # Calculate throttles
         omega = np.sqrt(np.abs(u_safe)/self.thrust_constant)   
-    
+
+        print("omega")
+        print(omega)
+
         # Calculate hrottles from omega (rotor velocities)
         throttles = (omega - (self.zero_position_armed * ones_temp))
         throttles = throttles / self.input_scaling
 
-        # print("throttles")
-        # print(throttles)
+        print("throttles")
+        print(throttles)
         
         # Inverse Mixing: throttles to normalized torques and thrust
-        normalized_torque_and_thrust = self.throttles_to_normalized_torques_and_thrust_ @ throttles
+        # normalized_torque_and_thrust = self.throttles_to_normalized_torques_and_thrust_ @ throttles
 
-        return normalized_torque_and_thrust, throttles
+        return throttles
 
     # CBF Function (No attack)
     def control_barrier_function_Noattack(self, indv_f):
         x_state = np.zeros(12)
         f_x = np.zeros(12)
-        barrier_phi_max = 15 / 180 * np.pi
-        barrier_theta_max = 15 / 180 * np.pi
+        barrier_phi_max = 20 / 180 * np.pi
+        barrier_theta_max = 20 / 180 * np.pi
         barrier_zdelta_max = 10
         barrier_vz_max = 10
-        u_max = 1.2 * self._uav_mass * self._gravity / 4
+        u_max = 1.7 * self._uav_mass * self._gravity / 4
         u_min = 0
 
         rotated_q = self.rotate_quaternion_from_to_ENU_NED(self.quat_odo)
@@ -305,9 +304,9 @@ class Controller_module(Node):
                             [0, 0, 0, 0],
                             [0, 0, 0, 0],
                             [0, 0, 0, 0],
-                            [self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2))],
+                            [-self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2))],
                             [-self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2))],
-                            [self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2]]])
+                            [-self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2]]])
                              # Expected Error Part (v1. Changed the x, y part)
         
         # Barrier Function (roll) # Expected Error Part 
@@ -393,9 +392,9 @@ class Controller_module(Node):
         f_x = np.zeros(12)
         barrier_phi_max = 15 / 180 * np.pi
         barrier_theta_max = 15 / 180 * np.pi
-        barrier_zdelta_max = 10
-        barrier_vz_max = 10
-        u_max = 1.2 * self._uav_mass * self._gravity / 4
+        barrier_zdelta_max = 5
+        barrier_vz_max = 5
+        u_max = 1.7 * self._uav_mass * self._gravity / 4
         u_min = 0
 
         rotated_q = self.rotate_quaternion_from_to_ENU_NED(self.quat_odo)
@@ -445,9 +444,9 @@ class Controller_module(Node):
                             [0, 0, 0, 0],
                             [0, 0, 0, 0],
                             [0, 0, 0, 0],
-                            [self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2))],
+                            [-self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[0]*np.sqrt(2))],
                             [-self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), -self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2)), self.thrust_constant*self.arm_length / (self._inertia_matrix[1]*np.sqrt(2))],
-                            [self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2]]])
+                            [-self.moment_constant*self.thrust_constant / self._inertia_matrix[2], -self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2], self.moment_constant*self.thrust_constant / self._inertia_matrix[2]]])
                              # Expected Error Part (v1. Changed the x, y part)
         
         # Barrier Function (roll) # Expected Error Part 
@@ -506,9 +505,9 @@ class Controller_module(Node):
                     ], dtype=np.float64)
         
         Q = np.eye(10, dtype=np.float64)
-        Q[7,7] = 100
-        Q[8,8] = 100
-        Q[9,9] = 100
+        Q[7,7] = 50
+        Q[8,8] = 50
+        Q[9,9] = 50
 
         f = np.array([-indv_f[0], -indv_f[1], -indv_f[2], -indv_f[3], 0, 0, 0, 0, 0, 0], dtype=np.float64)
         
@@ -579,7 +578,7 @@ class Controller_module(Node):
         msg.velocity = bool(vel_cont)
         msg.acceleration = bool(acc_cont)
         msg.attitude = bool(att_cont)
-        msg.direct_actuator = bool(act_cont)
+        msg.actuator = bool(act_cont)
 
         self.offboard_mode_publisher_.publish(msg)
 
